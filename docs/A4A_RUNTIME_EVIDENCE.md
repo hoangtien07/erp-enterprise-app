@@ -111,7 +111,7 @@ permlevel-restricted fields are dropped from `fields=` list requests but appear 
 | F7 | report allowlist + filter validation | **PARTIAL** | `Accounts Receivable` scoped correctly at data level, but REST path skips `validate_filters_permissions` — allowlist must carry pack-side filter scoping (§2.1) |
 | F8 | correlation header | **PASS with format fix** | pickup+echo confirmed under `monitor=1`; only `[0-9a-fA-F-]{8,64}` shapes survive (§2.2); redis/file flush path verified to redis list |
 | F9 | guest denied | **PASS** | unauthenticated → 403 PermissionError both surfaces |
-| F10 | deny must not reveal existence | **FAIL at ERP surface → bridge obligation** | 403 message names the company; 404-vs-403 distinguishes existence; nonexistent filter values → `DoesNotExistError`. Pack must normalize to `permission_denied` |
+| F10 | deny must not reveal existence | **RESOLVED at bridge (P1) · residual at raw REST** | Bridge: `not_found_or_denied` 403 byte-identical for missing vs denied (A5B_BRIDGE.md §3.1). Raw `/api/resource`+`/api/v2/document` still oracle — residual; kernel pack normalizes client-side |
 
 **Tally: pass 6 (F1,F2,F3,F4,F5-construction,F9) · conditional/corrected 3 (F6,F7,F8) · bridge obligation 1 (F10).**
 
