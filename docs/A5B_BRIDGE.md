@@ -46,8 +46,8 @@ one-by-one (`frappe.new_doc` + explicit `doc.append`/`doc.set`) — never
 | errcode | exc_type | HTTP | When |
 |---|---|---|---|
 | `schema_invalid` | `SchemaInvalid` | 400 | payload shape/version/`method` literal, items bound (≤100), qty>0, rate required ≥0, key ≤140 chars, hash = 64-hex |
-| `not_found` | `NotFound` | 404 | declared Link (Company/Supplier/Currency/Item/Warehouse) doesn't exist — fails fast before `insert()`'s own LinkValidationError |
-| `permission_denied` | `PermissionDenied` | 403 | missing `EWCP Write` role, no create perm, company outside UP scope |
+| `not_found_or_denied` | `NotFoundOrDenied` | 403 | **any resource-identifier probe fails** — declared Link (Company/Supplier/Currency/Item/Warehouse) missing OR outside the principal's User-Permission scope; also every Frappe-native existence/permission signal inside the method. See §3.1 |
+| `permission_denied` | `PermissionDenied` | 403 | principal-level denial only: missing `EWCP Write` role, no create perm |
 | `policy_violation` | `PolicyViolation` | 403 | declared `permission_policy` ≠ effective perms (role/UP/strict-UP mismatch) |
 | `proposal_expired` | `ProposalExpired` | 409 | `expires_at` in the past at execution |
 | `proposal_hash_mismatch` | `EWCPBridgeError` | 400 | `decision.payload_hash` ≠ `payload.payload_hash` (corruption signal; the real hash binding is kernel-side §2.3) |
@@ -55,7 +55,9 @@ one-by-one (`frappe.new_doc` + explicit `doc.append`/`doc.set`) — never
 | `draft_violation` | `DefectAlarm` | 500 | post-insert `docstatus != 0` — defect alarm, not a response |
 
 Frappe-native exceptions still surface as-is (e.g. `ValidationError` from a
-PO business rule → request rolls back per `app.py` exception path).
+PO business rule → request rolls back per `app.py` exception path), EXCEPT
+`frappe.PermissionError`/`frappe.DoesNotExistError`, which are normalized
+per §3.1.
 
 ## 2. Role + field fixtures (`fixtures.install` → `after_install`/`after_migrate`)
 
@@ -73,6 +75,57 @@ Order inside the method: `require_write_role` → `has_permission("Purchase Orde
 
 `guest`/unauth callers can't reach the function over HTTP (non-guest
 whitelist → 403 **VERIFIED-G1′**); in-process they die at `require_write_role`.
+
+### 3.1 F10 — no existence disclosure (P1 fix, VERIFIED-G1′)
+
+ERPNext's default denial leaks existence: 403-with-name for a denied doc
+vs 404 for a missing one (`docs/A4A_RUNTIME_EVIDENCE.md` F10). The bridge
+normalizes so the two are **byte-identical**:
+
+- **`authorization.name_in_scope(doctype, name, user, for_doctype)`** —
+  one predicate folding "exists" (`frappe.db.exists`) and "in UP scope"
+  (mirrors `check_user_permission_on_link_fields`,
+  `frappe/permissions.py`: only UP rows whose `applicable_for` is empty or
+  equals `for_doctype` restrict; descendants pre-expanded by
+  `get_user_permissions`). `_require_link` and `check_company_scope`
+  raise the uniform `NotFoundOrDenied` on `False`.
+- **`errors.normalize_existence`** — method-boundary decorator re-throws
+  `frappe.PermissionError`/`frappe.DoesNotExistError` as
+  `NotFoundOrDenied` (generic message, no doctype/name/user). Covers
+  insert-time UP denials on link fields the schema doesn't pre-check
+  (`uom`, `buying_price_list`, computed child rows) and doc read-backs.
+  `frappe.PermissionError`/`DoesNotExistError` share no ancestry with
+  `EWCPBridgeError`, so contract errors propagate unchanged.
+- **`NotFoundOrDenied`**: HTTP 403, `errcode=not_found_or_denied`,
+  fixed message. `NotFound` (404) is retained but no longer raised on
+  probes.
+
+**Measured (G1′, 2026-10-09):** `company=EWCP Dev Company B` vs
+`company=<bogus>` → both `HTTP 403`, body **byte-identical** (same
+`exc_type`, `exception` traceback, message). Same for supplier/item/
+warehouse probes. Success path unchanged (create 200 → replay 200).
+
+**Residual gaps (out of bridge scope):**
+
+- Raw REST `/api/resource/*` + `/api/v2/document/*` still oracle
+  (403-names-doc vs 404) — cannot be normalized from an app without
+  patching Frappe; kernel `erp_reads` pack maps 403/404 client-side
+  (A4a §6). Governed callers MUST NOT hit raw document endpoints for
+  doc-existence-sensitive reads.
+- Idempotency-key space: a collision with an *invisible* row yields the
+  same `IdempotencyConflict` as a hash mismatch — but free-key vs
+  taken-key still differs (200 vs 409). Keys are unguessable 140-char
+  values and the winner's `po_name` is never disclosed — weak oracle,
+  accepted.
+- Denial `exc` traceback reveals the raise site (schema vs authz vs
+  insert-time) — internal code-path info, not existence data.
+- `permission_denied` (role/create-perm) and `policy_violation` messages
+  echo the user and *declared* values — caller-supplied, no existence.
+- Strict-mode caveat (measured): a User Permission on a doctype that
+  appears as an EMPTY link field anywhere in the doc tree (e.g. the
+  auto-generated `Item Default` row's `default_supplier`) denies EVERY
+  insert — uniformly `not_found_or_denied`. UP on write-path doctypes is
+  effectively a kill-switch for this principal; treat as break-glass.
 
 ## 4. Exactly-once semantics
 
@@ -111,14 +164,20 @@ Site `ewcp-dev.localhost` @ `http://localhost:8080`
 `ewcp-agent@ewcp.dev` roles `[Accounts User, EWCP Write]`, UP `Company→A`):
 
 - `bench run-tests --module erp_enterprise_app.integrations.ewcp_bridge.tests.test_write`
-  → **19/19 OK** (test list maps §8 rows: replay/conflict, wrong company,
+  → **22/22 OK** (test list maps §8 rows: replay/conflict, wrong company,
   missing role, guest, injection, business-rule rollback, submit surfaces,
-  expiry, hash-mismatch, schema guards).
+  expiry, hash-mismatch, schema guards, plus P1 F10 rows: company
+  denied-vs-nonexistent identity, scoped-link identity, insert-time UP
+  normalization).
 - HTTP: `POST` create → 200 `{replayed:false, po_name:"PUR-ORD-2026-00001",
   docstatus:0, grand_total:75.0}`; same call again → `{replayed:true}`;
   GET → 403; unauth → 403; mutated payload same key → 409
-  `IdempotencyConflict`; `company=B` → 403 `permission_denied`;
+  `IdempotencyConflict`; `company=B` → 403 `not_found_or_denied`
+  (post-P1; was `permission_denied` naming the company);
   `PUT /api/resource/PO {docstatus:1}` → 403; key read-back returns the row.
+- F10 oracle kill (P1, 2026-10-09): `company=B` vs `company=<bogus>` →
+  identical 403 `NotFoundOrDenied` body (before: 403 `PermissionDenied`
+  naming the company vs 404 `NotFound`).
 - Fixtures: `SHOW INDEX` unique `ewcp_idempotency_key`; Custom DocPerm row
   `read=1 write=1 create=1 submit=0 cancel=0 amend=0 delete=0`; Role exists.
 

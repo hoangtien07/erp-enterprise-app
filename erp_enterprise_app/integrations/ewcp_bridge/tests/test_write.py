@@ -26,7 +26,7 @@ from erp_enterprise_app.integrations.ewcp_bridge import idempotency, write
 from erp_enterprise_app.integrations.ewcp_bridge.errors import (
 	EWCPBridgeError,
 	IdempotencyConflict,
-	NotFound,
+	NotFoundOrDenied,
 	PermissionDenied,
 	PolicyViolation,
 	ProposalExpired,
@@ -43,6 +43,38 @@ ITEM2 = "EWCP-ITEM-002"
 
 def _hash(n: int) -> str:
 	return f"{n:064x}"
+
+
+def _assert_generic_denial(tc: unittest.TestCase, exc: BaseException) -> None:
+	"""The F10 uniform denial: no doctype, doc name, or user in the text."""
+	tc.assertEqual(exc.errcode, "not_found_or_denied")
+	tc.assertEqual(exc.http_status_code, 403)
+	msg = str(exc)
+	for leaked in (
+		COMPANY_A,
+		COMPANY_B,
+		"NOPE",
+		"No Such Supplier",
+		AGENT,
+		"EWCP Probe",
+		"Nos",
+		"Purchase Order",
+		"Company",
+		"Supplier",
+		"UOM",
+	):
+		tc.assertNotIn(leaked, msg)
+
+
+def _assert_identical_denial(
+	tc: unittest.TestCase, exc_a: BaseException, exc_b: BaseException
+) -> None:
+	"""Exists-denied and nonexistent must be the SAME rejection (F10)."""
+	tc.assertIs(type(exc_a), type(exc_b))
+	tc.assertEqual(exc_a.http_status_code, exc_b.http_status_code)
+	tc.assertEqual(exc_a.errcode, exc_b.errcode)
+	tc.assertEqual(str(exc_a), str(exc_b))
+	_assert_generic_denial(tc, exc_a)
 
 
 def _payload(key: str, n: int = 1, **over) -> dict:
@@ -146,9 +178,83 @@ class TestCreateDraftPO(IntegrationTestCase):
 		bad = _payload("t-wrongco")
 		bad["company"] = COMPANY_B
 		bad["permission_policy"]["user_permissions"] = {"Company": [COMPANY_A]}
-		with self.assertRaises(PermissionDenied):
+		with self.assertRaises(NotFoundOrDenied):
 			write.create_draft_po(bad)
 		self.assertEqual(self._po_count("t-wrongco"), 0)
+
+	def test_company_denied_and_nonexistent_identical(self):
+		"""F10: company=B (exists, out-of-scope) and a bogus company must
+		fail with the identical denial — status, type, errcode, message."""
+		with self.assertRaises(NotFoundOrDenied) as denied:
+			write.create_draft_po(_payload("t-deniedco", company=COMPANY_B))
+		with self.assertRaises(NotFoundOrDenied) as missing:
+			write.create_draft_po(
+				_payload("t-missingco", company="EWCP Dev Company NOPE")
+			)
+		_assert_identical_denial(self, denied.exception, missing.exception)
+		self.assertEqual(self._po_count("t-deniedco"), 0)
+		self.assertEqual(self._po_count("t-missingco"), 0)
+
+	def test_scoped_link_denied_and_nonexistent_identical(self):
+		"""F10 generic over links: with a Supplier UP narrowing the
+		principal's visible set, an existing out-of-scope supplier and a
+		made-up one deny identically."""
+		frappe.set_user("Administrator")
+		supplier_b = "EWCP Probe Supplier B2"
+		if not frappe.db.exists("Supplier", supplier_b):
+			frappe.get_doc(
+				{
+					"doctype": "Supplier",
+					"supplier_name": supplier_b,
+					"supplier_group": "Services",
+				}
+			).insert(ignore_permissions=True)
+		frappe.permissions.add_user_permission("Supplier", SUPPLIER_A, AGENT)
+		frappe.set_user(AGENT)
+		try:
+			with self.assertRaises(NotFoundOrDenied) as denied:
+				write.create_draft_po(_payload("t-scopedsup", supplier=supplier_b))
+			with self.assertRaises(NotFoundOrDenied) as missing:
+				write.create_draft_po(
+					_payload("t-fakesup", supplier="No Such Supplier Co")
+				)
+			_assert_identical_denial(self, denied.exception, missing.exception)
+			# strict UP caveat (measured on G1′): with a Supplier UP the
+			# insert still dies — the auto-generated ``Item Default`` child
+			# row carries an EMPTY ``default_supplier`` Link which strict
+			# mode checks against the allowlist. It surfaces as the same
+			# uniform denial via the insert-time boundary.
+			with self.assertRaises(NotFoundOrDenied):
+				write.create_draft_po(_payload("t-scopedok", supplier=SUPPLIER_A))
+		finally:
+			frappe.set_user("Administrator")
+			frappe.permissions.remove_user_permission("Supplier", SUPPLIER_A, AGENT)
+			frappe.delete_doc("Supplier", supplier_b, force=True, ignore_permissions=True)
+			frappe.set_user(AGENT)
+
+	def test_insert_time_up_denial_normalized(self):
+		"""A UP denial on a link field the schema doesn't pre-check (uom)
+		must surface from inside doc.insert() as the SAME uniform error —
+		the boundary catches Frappe-native PermissionError."""
+		frappe.set_user("Administrator")
+		uom = "EWCP Probe UOM"
+		if not frappe.db.exists("UOM", uom):
+			frappe.get_doc({"doctype": "UOM", "uom_name": uom}).insert(
+				ignore_permissions=True
+			)
+		frappe.permissions.add_user_permission("UOM", uom, AGENT)
+		frappe.set_user(AGENT)
+		try:
+			p = _payload("t-uomdeny")
+			p["items"][0]["uom"] = "Nos"  # exists, out-of-scope, insert-time deny
+			with self.assertRaises(NotFoundOrDenied) as ctx:
+				write.create_draft_po(p)
+			_assert_generic_denial(self, ctx.exception)
+		finally:
+			frappe.set_user("Administrator")
+			frappe.permissions.remove_user_permission("UOM", uom, AGENT)
+			frappe.delete_doc("UOM", uom, force=True, ignore_permissions=True)
+			frappe.set_user(AGENT)
 
 	def test_policy_declared_scope_not_covering_write_denies(self):
 		# declared policy says Company B allowed, actual UP only covers A →
@@ -240,7 +346,7 @@ class TestCreateDraftPO(IntegrationTestCase):
 	def test_nonexistent_supplier_rejected_before_insert(self):
 		bad = _payload("t-badsup")
 		bad["supplier"] = "No Such Supplier Co"
-		with self.assertRaises(NotFound):
+		with self.assertRaises(NotFoundOrDenied):
 			write.create_draft_po(bad)
 		self.assertEqual(self._po_count("t-badsup"), 0)
 

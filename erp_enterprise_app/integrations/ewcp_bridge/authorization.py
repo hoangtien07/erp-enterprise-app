@@ -21,7 +21,12 @@ enforcement of record.
 
 import frappe
 
-from .errors import EWCPBridgeError, PermissionDenied, PolicyViolation
+from .errors import (
+	EWCPBridgeError,
+	NotFoundOrDenied,
+	PermissionDenied,
+	PolicyViolation,
+)
 
 REQUIRED_ROLE = "EWCP Write"
 PO_DOCTYPE = "Purchase Order"
@@ -76,24 +81,50 @@ def _effective_user_permissions(user: str) -> dict:
 	}
 
 
+def name_in_scope(
+	link_doctype: str,
+	name: str,
+	user: str | None = None,
+	*,
+	for_doctype: str = PO_DOCTYPE,
+) -> bool:
+	"""True iff ``name`` is usable as a Link target on ``for_doctype``.
+
+	Mirrors the link-field step of ``has_user_permission``
+	(``frappe/permissions.py`` ``check_user_permission_on_link_fields``):
+	User Permission rows on ``link_doctype`` restrict the usable values to
+	their allowlist — but only rows applicable to ``for_doctype`` (empty
+	``applicable_for`` = all doctypes). Existence folds into the same
+	boolean, so callers emit ONE denial that cannot distinguish a missing
+	document from a denied one (F10).
+	"""
+
+	user = user or frappe.session.user
+	ups = frappe.permissions.get_user_permissions(user) or {}
+	allowed = [
+		row.get("doc")
+		for row in ups.get(link_doctype, [])
+		if not row.get("applicable_for") or row.get("applicable_for") == for_doctype
+	]
+	if allowed and name not in allowed:
+		return False
+	return bool(frappe.db.exists(link_doctype, name))
+
+
 def check_company_scope(company: str, user: str | None = None) -> None:
-	"""The declared company must sit inside the user's Company UP scope.
+	"""The declared company must resolve inside the user's visible scope.
 
 	This is the *independent* scope check: it resolves the permission
 	against the ERP execution principal, never against caller text.
 	``doc.insert()`` will re-run the full link-field UP walk anyway —
-	this earlier check exists to produce a precise ``permission_denied``
-	rather than a generic insert-time PermissionError.
+	this earlier check exists to fail before insert.
+
+	F10: the rejection is the uniform ``not_found_or_denied`` — a
+	nonexistent company and an out-of-scope one are indistinguishable.
 	"""
 
-	user = user or frappe.session.user
-	ups = _effective_user_permissions(user)
-	allowed = ups.get("Company")
-	if allowed is not None and company not in allowed:
-		raise PermissionDenied(
-			f"permission_denied: company {company!r} outside User Permission "
-			f"scope of {user}"
-		)
+	if not name_in_scope("Company", company, user, for_doctype=PO_DOCTYPE):
+		raise NotFoundOrDenied()
 
 
 def verify_permission_policy(policy: dict, user: str | None = None) -> None:

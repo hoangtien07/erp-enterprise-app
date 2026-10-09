@@ -32,9 +32,10 @@ from frappe.utils import flt, getdate, now_datetime
 from . import authorization, idempotency
 from .errors import (
 	EWCPBridgeError,
-	NotFound,
+	NotFoundOrDenied,
 	ProposalExpired,
 	SchemaInvalid,
+	normalize_existence,
 )
 
 PO_DOCTYPE = "Purchase Order"
@@ -91,8 +92,13 @@ def _require_str(payload: dict, field: str) -> str:
 
 
 def _require_link(field: str, doctype: str, value: str) -> str:
-	if not frappe.db.exists(doctype, value):
-		raise NotFound(f"not_found: {doctype} {value!r} does not exist")
+	"""Declared Link must resolve inside the caller's effective scope.
+
+	F10: missing and out-of-scope collapse into one uniform denial —
+	the response can never leak which of the two it was.
+	"""
+	if not authorization.name_in_scope(doctype, value):
+		raise NotFoundOrDenied()
 	return value
 
 
@@ -211,9 +217,10 @@ def _validate_payload(payload) -> dict:
 	_validate_expiry(payload)
 	requester, approved_by = _validate_actor_and_decision(payload)
 
-	company = _require_link(
-		"company", "Company", _require_str(payload, "company")
-	)
+	# company existence is NOT checked here — resolving the name would be
+	# an existence oracle at schema phase. check_company_scope in the
+	# authorization phase emits the uniform F10 denial.
+	company = _require_str(payload, "company")
 	supplier = _require_link(
 		"supplier", "Supplier", _require_str(payload, "supplier")
 	)
@@ -301,6 +308,7 @@ def _response(doc, *, replayed: bool) -> dict:
 
 
 @frappe.whitelist(methods=["POST"])
+@normalize_existence
 def create_draft_po(payload: dict) -> dict:
 	"""Create one draft Purchase Order under the governed-write contract.
 
@@ -308,6 +316,10 @@ def create_draft_po(payload: dict) -> dict:
 	authorization (role → create perm → company scope → policy verify) →
 	idempotency pre-check → build → insert (single request txn) →
 	draft assertion → read-back response.
+
+	``@normalize_existence`` re-throws any Frappe-native existence or
+	permission signal from inside the method (insert-time UP walk,
+	doc read-back) as the uniform ``not_found_or_denied`` — F10.
 	"""
 
 	v = _validate_payload(payload)
