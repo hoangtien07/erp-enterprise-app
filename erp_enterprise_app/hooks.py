@@ -5,10 +5,16 @@ app_description = "EWCP ERP custom app — erp-ewcp-bridge + VN customizations"
 app_email = "tienproanhhp@gmail.com"
 app_license = "TBD"  # chốt license trước khi giao khách (Batch 9)
 
-# Company-scope hardening (W2 build-item 2) — fill in A4:
+# A5b governed-write fixtures (WP-A5b): EWCP Write role + PO custom fields
+# (ewcp_idempotency_key unique anchor + hash/audit stamps) + Custom DocPerm
+# (create+write+read, no submit). Idempotent — safe on every migrate.
+after_install = "erp_enterprise_app.integrations.ewcp_bridge.fixtures.install"
+after_migrate = "erp_enterprise_app.integrations.ewcp_bridge.fixtures.install"
+
+# Company-scope hardening (W2 build-item 2) — read-side hook, still A4:
 # permission_query_conditions = {
 #     "Company": "erp_enterprise_app.integrations.ewcp_bridge.authorization.company_scope_pqc",
 # }
 
-# Event subscriptions for governed writes — fill in A5:
+# Event subscriptions for governed writes — none in A5b wave 1:
 # doc_events = {}

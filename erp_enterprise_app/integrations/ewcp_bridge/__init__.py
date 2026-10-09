@@ -1,8 +1,11 @@
 """erp-ewcp-bridge — governed ERP access surface for EWCP kernel.
 
-Implemented in Track A A4 (reads) / A5 (writes) per
-EXECUTION_STRATEGY_VNEXT + W2 build-items:
-- scoped whitelisted read methods (Company/User-Permission enforced)
-- atomic whitelisted write methods (multi-step in one txn)
-- idempotency layer (unique key + dup-catch + read-back)
+Implemented surfaces:
+- A5b governed write: ``write.create_draft_po`` (whitelisted POST) —
+  draft Purchase Order only, role+scope fail-closed, exactly-once via the
+  ``ewcp_idempotency_key`` unique field. See ``docs/A5B_BRIDGE.md``.
+- fixtures: ``fixtures.install`` deploys the ``EWCP Write`` role, PO
+  custom fields, and the Custom DocPerm (create+write+read, no submit).
+
+Read side (A4) is contract-only; see ``docs/A4A_READ_CONTRACT.md``.
 """
